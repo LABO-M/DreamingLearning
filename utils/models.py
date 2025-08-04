@@ -68,3 +68,18 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
+
+# ----------------------------------
+# LSTM モデル（価格予測用）
+# ----------------------------------
+
+class LSTMPriceModel(torch.nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=128, num_layers=2):
+        super().__init__()
+        self.lstm = torch.nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = torch.nn.Linear(hidden_dim, 1)  # 回帰出力
+
+    def forward(self, x, hidden=None):
+        out, hidden = self.lstm(x, hidden)
+        out = self.fc(out)
+        return out, hidden
