@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn.functional as F
+from torch.nn import MSELoss
 import random
 
 def sample_sequence(model, start_token, seq_len, temperature=1.0, device='cpu'):
@@ -65,3 +66,56 @@ def train(model, data, vocab_size, optimizer, device='cpu',
         avg_loss = total_loss / max(1, len(data))
         avg_dreaming_loss = total_dreaming_loss / max(1, dreaming_steps)
         print(f"Epoch {epoch+1}: loss = {avg_loss:.4f}, dreaming_loss = {avg_dreaming_loss:.4f}")
+
+
+def train_price(model, data, optimizer, device='cpu',
+                temperature=0.05, dreaming_ratio=0.2, dreaming_seq_len=50, epochs=5):
+    criterion = MSELoss()
+    model.train()
+
+    for epoch in range(epochs):
+        total_loss = 0
+        total_dreaming_loss = 0
+
+        # 通常の学習
+        for seq in data:
+            arr = torch.tensor(seq, dtype=torch.float32, device=device).view(1, -1, 1)
+            input_seq = arr[:, :-1]
+            target_seq = arr[:, 1:]
+
+            optimizer.zero_grad()
+            output, _ = model(input_seq)
+            loss = criterion(output, target_seq)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        # Dreaming学習
+        dreaming_steps = int(len(data) * dreaming_ratio)
+        for _ in range(dreaming_steps):
+            idx = torch.randint(0, len(data), (1,)).item()
+            start = torch.tensor([data[idx][0]], dtype=torch.float32).to(device)
+            generated = [start]
+
+            model.eval()
+            with torch.no_grad():
+                input_val = start.view(1, 1, 1)
+                hidden = None
+                for _ in range(dreaming_seq_len - 1):
+                    output, hidden = model(input_val, hidden)
+                    next_val = output[:, -1, 0] + torch.randn_like(start) * temperature
+                    generated.append(next_val)
+                    input_val = next_val.view(1, 1, 1)
+
+            model.train()
+            gen_seq = torch.stack(generated).view(1, -1, 1)
+            inp = gen_seq[:, :-1]
+            tgt = gen_seq[:, 1:]
+
+            optimizer.zero_grad()
+            d_loss = criterion(model(inp)[0], tgt)
+            d_loss.backward()
+            optimizer.step()
+            total_dreaming_loss += d_loss.item()
+
+        print(f"[Epoch {epoch+1}] loss={total_loss/len(data):.6f}, dreaming_loss={total_dreaming_loss/max(1, dreaming_steps):.6f}")
