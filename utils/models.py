@@ -77,7 +77,8 @@ class LSTMPriceModel(torch.nn.Module):
     def __init__(self, input_dim=1, hidden_dim=128, num_layers=2):
         super().__init__()
         self.lstm = torch.nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc = torch.nn.Linear(hidden_dim, 1)  # 回帰出力
+        # 予測の平均と対数分散を出力するように変更
+        self.fc = torch.nn.Linear(hidden_dim, 2)
 
     def forward(self, x, hidden=None):
         out, hidden = self.lstm(x, hidden)

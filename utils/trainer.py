@@ -69,7 +69,10 @@ def train(model, data, vocab_size, optimizer, device='cpu',
 
 
 def train_price(model, data, optimizer, device='cpu',
-                temperature=0.05, dreaming_ratio=0.2, dreaming_seq_len=50, epochs=5):
+                temperature=1.5, dreaming_ratio=0.2, dreaming_seq_len=50, epochs=5):
+    # MSELossは平均と分散のパラメータ予測には適さないため、
+    # 損失関数を修正する必要がある。ここでは、簡単のため、
+    # 平均の予測に対してのみMSEを計算する。
     criterion = MSELoss()
     model.train()
 
@@ -77,20 +80,22 @@ def train_price(model, data, optimizer, device='cpu',
         total_loss = 0
         total_dreaming_loss = 0
 
-        # 通常の学習
+        # --- 通常の学習 ---
         for seq in data:
             arr = torch.tensor(seq, dtype=torch.float32, device=device).view(1, -1, 1)
             input_seq = arr[:, :-1]
             target_seq = arr[:, 1:]
 
             optimizer.zero_grad()
+            # モデルから平均と対数分散を出力
             output, _ = model(input_seq)
-            loss = criterion(output, target_seq)
+            mean_pred = output[:, :, 0:1] # 平均の予測
+            loss = criterion(mean_pred, target_seq)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
-        # Dreaming学習
+        # --- Dreaming学習（ギブスサンプリングを実装） ---
         dreaming_steps = int(len(data) * dreaming_ratio)
         for _ in range(dreaming_steps):
             idx = torch.randint(0, len(data), (1,)).item()
@@ -102,8 +107,17 @@ def train_price(model, data, optimizer, device='cpu',
                 input_val = start.view(1, 1, 1)
                 hidden = None
                 for _ in range(dreaming_seq_len - 1):
+                    # モデルから平均と対数分散を取得
                     output, hidden = model(input_val, hidden)
-                    next_val = output[:, -1, 0] + torch.randn_like(start) * temperature
+                    mean = output[:, -1, 0]
+                    log_variance = output[:, -1, 1]
+
+                    # サンプリング温度を分散に乗じて探索を制御
+                    variance = torch.exp(log_variance) * temperature
+
+                    # 予測されたガウス分布からサンプリング
+                    dist = torch.distributions.Normal(mean, torch.sqrt(variance))
+                    next_val = dist.sample()
                     generated.append(next_val)
                     input_val = next_val.view(1, 1, 1)
 
@@ -113,7 +127,10 @@ def train_price(model, data, optimizer, device='cpu',
             tgt = gen_seq[:, 1:]
 
             optimizer.zero_grad()
-            d_loss = criterion(model(inp)[0], tgt)
+            # 人工データの平均の予測に対して損失を計算
+            d_output, _ = model(inp)
+            d_mean_pred = d_output[:, :, 0:1]
+            d_loss = criterion(d_mean_pred, tgt)
             d_loss.backward()
             optimizer.step()
             total_dreaming_loss += d_loss.item()
