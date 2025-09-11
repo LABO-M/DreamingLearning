@@ -1,8 +1,12 @@
 # utils/trainer.py
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import MSELoss
+import random
+from torch.distributions import Normal
+from torch.optim import Adam
 import random
 
 def sample_sequence(model, start_token, seq_len, temperature=1.0, device='cpu'):
@@ -136,3 +140,90 @@ def train_price(model, data, optimizer, device='cpu',
             total_dreaming_loss += d_loss.item()
 
         print(f"[Epoch {epoch+1}] loss={total_loss/len(data):.6f}, dreaming_loss={total_dreaming_loss/max(1, dreaming_steps):.6f}")
+
+
+def train_portfolio(model, train_loader, val_loader, n_assets, optimizer, epochs=10, temperature=1.5):
+    vol_criterion = nn.MSELoss()
+    corr_criterion = nn.MSELoss()
+    device = next(model.parameters()).device
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        dreaming_loss = 0
+
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            # ボラティリティと相関の正解データを計算
+            true_vols = torch.var(targets, dim=1)
+            true_corrs = torch.stack([
+                torch.corrcoef(targets[i].T)[torch.triu(torch.ones(n_assets, n_assets), diagonal=1).bool()]
+                for i in range(targets.size(0))
+            ]).to(device)
+
+            optimizer.zero_grad()
+            pred_vols, pred_corrs = model(inputs)
+            loss_vol = vol_criterion(pred_vols, true_vols)
+            loss_corr = corr_criterion(pred_corrs, true_corrs)
+            loss = loss_vol + loss_corr
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        # Dreaming Phase
+        model.eval()
+        dreaming_inputs = next(iter(train_loader))[0].to(device)
+        generated_sequences = generate_dreaming_data(model, dreaming_inputs, temperature)
+
+        model.train()
+        d_loss = 0
+        for seq in generated_sequences:
+            true_vols = torch.var(seq, dim=1)
+            true_corrs = torch.stack([
+                torch.corrcoef(seq[i].T)[torch.triu(torch.ones(n_assets, n_assets), diagonal=1).bool()]
+                for i in range(seq.size(0))
+            ]).to(device)
+
+            optimizer.zero_grad()
+            pred_vols, pred_corrs = model(seq)
+            d_loss_vol = vol_criterion(pred_vols, true_vols)
+            d_loss_corr = corr_criterion(pred_corrs, true_corrs)
+            loss = d_loss_vol + d_loss_corr
+            loss.backward()
+            optimizer.step()
+            d_loss += loss.item()
+
+        avg_train_loss = train_loss / len(train_loader)
+        avg_dreaming_loss = d_loss / len(generated_sequences)
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Dreaming Loss: {avg_dreaming_loss:.4f}")
+
+def generate_dreaming_data(model, inputs, temperature, seq_len=50):
+    model.eval()
+    B, L, D = inputs.shape
+    generated = []
+    with torch.no_grad():
+        for i in range(B):
+            current_input = inputs[i, -1, :].unsqueeze(0).unsqueeze(0)
+            generated_seq = current_input.clone()
+
+            for _ in range(seq_len):
+                lstm_out, _ = model.lstm(current_input)
+                mean_pred = model.vol_head(lstm_out[:, -1, :])
+
+                # 相関ヘッドの出力を利用して分散を予測（モデル定義に合わせる）
+                log_variance_pred = model.corr_head(lstm_out[:, -1, :])[:, :D] # ボラティリティ分だけ使用
+
+                variance = torch.exp(log_variance_pred) * temperature
+
+                dist = Normal(mean_pred, torch.sqrt(variance))
+                next_val = dist.sample()
+
+                # ★ここが修正点★
+                # next_valの形状を [B, L, D] に合わせる
+                next_val_reshaped = next_val.unsqueeze(0).unsqueeze(0) # [1, 1, D]
+
+                generated_seq = torch.cat((generated_seq, next_val_reshaped), dim=1)
+                current_input = next_val_reshaped
+            generated.append(generated_seq[:, 1:, :])
+    return generated

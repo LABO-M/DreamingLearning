@@ -84,3 +84,25 @@ class LSTMPriceModel(torch.nn.Module):
         out, hidden = self.lstm(x, hidden)
         out = self.fc(out)
         return out, hidden
+
+
+
+class PortfolioLSTMModel(nn.Module):
+    def __init__(self, n_assets, hidden_dim=128, num_layers=2):
+        super().__init__()
+        self.n_assets = n_assets
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(n_assets, hidden_dim, num_layers, batch_first=True)
+        # ボラティリティ（各資産の分散）を予測
+        self.vol_head = nn.Linear(hidden_dim, n_assets)
+        # 相関（各ペアの相関係数）を予測
+        n_correlations = n_assets * (n_assets - 1) // 2
+        self.corr_head = nn.Linear(hidden_dim, n_correlations)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        last_hidden_state = lstm_out[:, -1, :] # 最後の時間ステップの隠れ状態
+        vol_pred = self.vol_head(last_hidden_state)
+        corr_pred = self.corr_head(last_hidden_state)
+        return torch.exp(vol_pred), torch.tanh(corr_pred) # 分散は正、相関は-1~1に制約
