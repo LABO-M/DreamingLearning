@@ -196,8 +196,8 @@ class DreamingTrainer:
         d_sum, d_steps = 0.0, 0
         for _ in range(self.dreaming_steps_per_epoch):
             start_window = self._make_start_window_from(data)
-            dreamed = self._sample_sequence_continuous_exo(start_window, self.dreaming_seq_len, T)
-            loss_d = self._train_step_dreaming(dreamed)
+            dream_seq = self._sample_sequence_continuous_exo(start_window, self.dreaming_seq_len, T)
+            loss_d = self._train_step_dreaming(dream_seq)
             d_sum += loss_d; d_steps += 1
             if d_steps % 20 == 0:
                 print(f"[DREAMING] step {d_steps}/{self.dreaming_steps_per_epoch}, loss={loss_d:.6f}")
@@ -265,17 +265,25 @@ class DreamingTrainer:
         self.optim.step()
         return float(loss.item())
 
-    def _train_step_dreaming(self, dreamed_list):
+    def _train_step_dreaming(self, dream_seq):
+        """
+        dream_seq: [1, K, D]  （_sample_sequence_continuous_exo の出力をそのまま入れる）
+        """
         self.model.train()
-        inp, tgt = self._dream_to_batch(dreamed_list)          # [1,K-1,1], [1,K-1,1]
+        assert isinstance(dream_seq, torch.Tensor) and dream_seq.dim() == 3
+        inp = dream_seq[:, :-1, :]         # [1,K-1,D]
+        tgt = dream_seq[:, 1:, [0]]        # [1,K-1,1]  ← 教師はターゲット列のみ
+
         out, _ = self.model(inp)
         mu, logvar = self._parse_mu_logvar(out)
         loss = gaussian_nll(mu, logvar, tgt)
+
         self.optim.zero_grad(); loss.backward()
         if self.grad_clip is not None:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optim.step()
         return float(loss.item())
+
 
     # ---------- 内部：Dreaming 生成 ----------
     @torch.no_grad()
@@ -306,7 +314,6 @@ class DreamingTrainer:
             sigma_T = var_T.sqrt()
 
             r_next = mu_t + sigma_T * torch.randn_like(mu_t)  # [1,1,1]
-            dreamed_target.append(r_next.item())
 
             # 外生を次時点に整える
             D = x.size(-1)
@@ -323,10 +330,12 @@ class DreamingTrainer:
             else:
                 x_next = r_next
 
+            dreamed_target.append(x_next)
             x = torch.cat([x, x_next], dim=1)
 
+        dream_seq = torch.cat(dreamed_target, dim=1)  # [1,seq_len,D]
         if was_training: self.model.train()
-        return dreamed_target
+        return dream_seq
 
     # ---------- 内部：前処理/補助 ----------
     def _to_tensor(self, seq):

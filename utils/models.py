@@ -72,18 +72,56 @@ class PositionalEncoding(nn.Module):
 # ----------------------------------
 # LSTM モデル（価格予測用）
 # ----------------------------------
-
-class LSTMPriceModel(torch.nn.Module):
-    def __init__(self, input_dim=1, hidden_dim=128, num_layers=2):
+class LSTMGaussian(nn.Module):
+    """
+    入力: x [B, L, D]  (D=1+n_exo, 列0=ターゲット)
+    出力: out [B, L, 2]  ([...,0]=μ, [...,1]=logσ²), hidden_next
+    """
+    def __init__(self, input_dim, hidden_size=128, num_layers=1,
+                 proj_dim=None, dropout=0.0, use_layernorm=False):
         super().__init__()
-        self.lstm = torch.nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        # 予測の平均と対数分散を出力するように変更
-        self.fc = torch.nn.Linear(hidden_dim, 2)
+        self.use_proj = proj_dim is not None and proj_dim != input_dim
+        self.in_dim = input_dim if not self.use_proj else proj_dim
+
+        if self.use_proj:
+            self.in_proj = nn.Linear(input_dim, proj_dim)
+            self.ln_in = nn.LayerNorm(proj_dim) if use_layernorm else nn.Identity()
+
+        self.rnn = nn.LSTM(
+            input_size=self.in_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+
+        # ヘッド：μ / logσ²
+        self.head_mu = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+        )
+        self.head_lv = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+        )
+
+        self.ln_head = nn.LayerNorm(hidden_size) if use_layernorm else nn.Identity()
 
     def forward(self, x, hidden=None):
-        out, hidden = self.lstm(x, hidden)
-        out = self.fc(out)
-        return out#, hidden
+        # x: [B,L,D]
+        if self.use_proj:
+            x = self.ln_in(self.in_proj(x))
+        h, hidden_next = self.rnn(x, hidden)          # [B,L,H]
+        h = self.ln_head(h)
+        mu = self.head_mu(h)                          # [B,L,1]
+        logvar = self.head_lv(h).clamp(-20, 10)       # 数値安定（Trainer側でも再clamp）
+        out = torch.cat([mu, logvar], dim=-1)         # [B,L,2]
+        return out, hidden_next
+
 
 
 
