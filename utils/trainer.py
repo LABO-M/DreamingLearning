@@ -8,138 +8,383 @@ import random
 from torch.distributions import Normal
 from torch.optim import Adam
 import random
+import numpy as np
+import os
+import math
 
-def sample_sequence(model, start_token, seq_len, temperature=1.0, device='cpu'):
-    model.eval()
-    generated = [start_token]
-    input_token = torch.tensor([[start_token]], device=device)
-    hidden = None
+# ===================== ユーティリティ =====================
 
-    with torch.no_grad():  # 勾配計算不要
-        for _ in range(seq_len - 1):
-            logits, hidden = model(input_token, hidden)  # logits: [1, 1, vocab_size]
-            logits = logits[:, -1, :] / temperature       # 温度でスケーリング
-            probs = F.softmax(logits, dim=-1)             # ソフトマックスで確率分布化
-            next_token = torch.multinomial(probs, num_samples=1)  # サンプリング
-            generated.append(next_token.item())
-            input_token = next_token.unsqueeze(0)         # 次ステップの入力に整形
+def seed_all(seed=42):
+    random.seed(seed); np.random.seed(seed); os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-    return generated
-def train(model, data, vocab_size, optimizer, device='cpu',
-          temperature=1.5, dreaming_ratio=0.2, dreaming_seq_len=20, epochs=5):
-    criterion = torch.nn.CrossEntropyLoss()
-    model.train()
+def gaussian_nll(mu, logvar, target):
+    """
+    連続値のガウスNLL（定数項は省略可）
+    mu/logvar/target: [B, L, 1]
+    L = 0.5*((y - μ)^2 / σ^2 + log σ^2)
+    """
+    var = logvar.exp().clamp_min(1e-12)
+    nll = 0.5 * ((target - mu) ** 2 / var + logvar)
+    return nll.mean()
 
-    for epoch in range(epochs):
-        random.shuffle(data)
-        total_loss = 0
-        total_dreaming_loss = 0
+class TemperatureScheduler:
+    def __init__(self, kind="constant", base=1.5, **kw):
+        self.kind, self.base, self.kw = kind, float(base), kw
+        self.best = float("inf"); self.bad_epochs = 0
 
-        # --- 通常の学習（Vanilla phase） ---
-        for x in data:
-            x = torch.tensor(x, dtype=torch.long, device=device).unsqueeze(0)  # [1, seq_len]
-            if x.size(1) < 2:
-                continue  # 入力長不足のデータをスキップ
+    def step(self, epoch=None, val_metric=None):
+        k = self.kind
+        if k == "constant":
+            return self.base
+        if k == "cosine":
+            t_min = float(self.kw.get("t_min", 1.2))
+            t_max = float(self.kw.get("t_max", 1.8))
+            period = max(1, int(self.kw.get("period", 10)))
+            phase = (epoch % period) / period
+            return t_min + 0.5*(t_max - t_min)*(1 - math.cos(2*math.pi*phase))
+        if k == "step":
+            milestones = self.kw.get("milestones", [10, 20])
+            gamma = float(self.kw.get("gamma", 1.1))
+            T = self.base
+            for m in milestones:
+                if epoch is not None and epoch >= m:
+                    T *= gamma
+            return T
+        if k == "plateau":
+            patience = int(self.kw.get("patience", 3))
+            factor   = float(self.kw.get("factor", 1.1))
+            if val_metric is None: return self.base
+            if val_metric < self.best - 1e-6:
+                self.best = val_metric; self.bad_epochs = 0
+            else:
+                self.bad_epochs += 1
+            return self.base * (factor if self.bad_epochs >= patience else 1.0)
+        return self.base
 
-            inputs = x[:, :-1]
-            targets = x[:, 1:]
+# ===================== メイン：DreamingTrainer =====================
 
-            optimizer.zero_grad()
-            output, _ = model(inputs)  # 出力: [1, seq_len-1, vocab_size]
-            loss = criterion(output.reshape(-1, vocab_size), targets.reshape(-1))
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+class DreamingTrainer:
+    """
+    連続値用 Dreaming 学習（LSTM＋ガウスヘッド想定）
+    - model(x, hidden)-> (output, hidden_next)
+      output[...,0]=μ, output[...,1]=logσ² というあなたの現行仕様に合わせています
+    - data: list of sequences（各要素 shape=[L] か [L,D], D=1+n_exo）
+    """
 
-        # --- ドリーミング学習（Dreaming phase） ---
-        dreaming_steps = int(len(data) * dreaming_ratio)
-        for _ in range(dreaming_steps):
-            start_token = random.randint(0, vocab_size - 1)
-            generated = sample_sequence(model, start_token, dreaming_seq_len, temperature, device)
+    def __init__(self, model, optimizer, device='cpu',
+                 # 粒度
+                 interleave_mode="epoch",  # "epoch"|"batch"|"mixed"
+                 epochs=5, warm_vanilla_steps=0,
+                 max_vanilla_steps_per_epoch=200,
+                 dreaming_steps_per_epoch=50,
+                 dreaming_seq_len=50,
+                 K_interleave=6, lambda_d=0.2,
+                 # 温度
+                 temperature=1.5,
+                 temperature_schedule="constant",
+                 temperature_params=None,
+                 # 外生
+                 exo_mode="hold",  # "hold"|"resample"|"roll"
+                 # 数値安定・再現
+                 grad_clip=1.0, logvar_clamp=(-20, 10), seed=42):
 
-            input_seq = torch.tensor(generated[:-1], dtype=torch.long, device=device).unsqueeze(0)
-            target_seq = torch.tensor(generated[1:], dtype=torch.long, device=device).unsqueeze(0)
+        self.model = model
+        self.optim = optimizer
+        self.device = device
 
-            optimizer.zero_grad()
-            output, _ = model(input_seq)
-            dreaming_loss = criterion(output.reshape(-1, vocab_size), target_seq.reshape(-1))
-            dreaming_loss.backward()
-            optimizer.step()
-            total_dreaming_loss += dreaming_loss.item()
+        self.interleave_mode = interleave_mode
+        self.epochs = epochs
+        self.warm_vanilla_steps = warm_vanilla_steps
+        self.max_vanilla_steps_per_epoch = max_vanilla_steps_per_epoch
+        self.dreaming_steps_per_epoch = dreaming_steps_per_epoch
+        self.dreaming_seq_len = dreaming_seq_len
+        self.K_interleave = K_interleave
+        self.lambda_d = lambda_d
 
-        avg_loss = total_loss / max(1, len(data))
-        avg_dreaming_loss = total_dreaming_loss / max(1, dreaming_steps)
-        print(f"Epoch {epoch+1}: loss = {avg_loss:.4f}, dreaming_loss = {avg_dreaming_loss:.4f}")
+        self.temperature = temperature
+        self.sched = TemperatureScheduler(temperature_schedule, base=temperature,
+                                          **(temperature_params or {}))
+        self.exo_mode = exo_mode
 
+        self.grad_clip = grad_clip
+        self.logvar_clamp = logvar_clamp
+        self.seed = seed
 
-def train_price(model, data, optimizer, device='cpu',
-                temperature=1.5, dreaming_ratio=0.2, dreaming_seq_len=50, epochs=5):
-    # MSELossは平均と分散のパラメータ予測には適さないため、
-    # 損失関数を修正する必要がある。ここでは、簡単のため、
-    # 平均の予測に対してのみMSEを計算する。
-    criterion = MSELoss()
-    model.train()
+    # ---------- 公開API ----------
+    def train(self, data, val_data=None):
+        """
+        data: list[ np.ndarray | list | torch.Tensor ]
+              各要素は shape=[L] か [L,D], D=1+n_exo
+              先頭列（index=0）をターゲットとみなします。
+        """
+        seed_all(self.seed)
+        self.model.to(self.device)
 
-    for epoch in range(epochs):
-        total_loss = 0
-        total_dreaming_loss = 0
+        # Warm-up (Vanilla only)
+        if self.warm_vanilla_steps > 0:
+            print(f"[WARMUP] vanilla_steps={self.warm_vanilla_steps}")
+            self.model.train()
+            steps = 0
+            for seq in self._epoch_iter(data):
+                loss_v = self._train_step_vanilla(seq)
+                steps += 1
+                if steps % 50 == 0:
+                    print(f"[WARMUP] step {steps}, loss={loss_v:.6f}")
+                if steps >= self.warm_vanilla_steps:
+                    break
 
-        # --- 通常の学習 ---
-        for seq in data:
-            arr = torch.tensor(seq, dtype=torch.float32, device=device).view(1, -1, 1)
-            input_seq = arr[:, :-1]
-            target_seq = arr[:, 1:]
+        best_val = float('inf')
 
-            optimizer.zero_grad()
-            # モデルから平均と対数分散を出力
-            output, _ = model(input_seq)
-            mean_pred = output[:, :, 0:1] # 平均の予測
-            loss = criterion(mean_pred, target_seq)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+        # Epoch loop
+        for e in range(1, self.epochs + 1):
+            # 温度更新（plateauはVal後にも再評価）
+            T = self.sched.step(epoch=e)
 
-        # --- Dreaming学習（ギブスサンプリングを実装） ---
-        dreaming_steps = int(len(data) * dreaming_ratio)
-        for _ in range(dreaming_steps):
-            idx = torch.randint(0, len(data), (1,)).item()
-            start = torch.tensor([data[idx][0]], dtype=torch.float32).to(device)
-            generated = [start]
+            if self.interleave_mode == "epoch":
+                v_avg, d_avg = self._run_epoch_mode(data, T)
+            elif self.interleave_mode == "batch":
+                v_avg, d_avg = self._run_batch_mode(data, T)
+            else:  # "mixed"
+                v_avg, d_avg = self._run_mixed_mode(data, T)
 
-            model.eval()
-            with torch.no_grad():
-                input_val = start.view(1, 1, 1)
-                hidden = None
-                for _ in range(dreaming_seq_len - 1):
-                    # モデルから平均と対数分散を取得
-                    output, hidden = model(input_val, hidden)
-                    mean = output[:, -1, 0]
-                    log_variance = output[:, -1, 1]
+            # Validation（任意）
+            val_nll = None
+            if val_data is not None:
+                val_nll = self.evaluate_nll(val_data)
+                best_val = min(best_val, val_nll)
+                print(f"[E{e}] VAL nll={val_nll:.6f} (best={best_val:.6f})")
 
-                    # サンプリング温度を分散に乗じて探索を制御
-                    variance = torch.exp(log_variance) * temperature
+            # plateau の場合はValで再調整
+            if isinstance(self.sched, TemperatureScheduler) and self.sched.kind == "plateau":
+                T = self.sched.step(epoch=e, val_metric=val_nll)
 
-                    # 予測されたガウス分布からサンプリング
-                    dist = torch.distributions.Normal(mean, torch.sqrt(variance))
-                    next_val = dist.sample()
-                    generated.append(next_val)
-                    input_val = next_val.view(1, 1, 1)
+            print(f"[E{e}] SUMMARY: vanilla_loss={v_avg:.6f}, dreaming_loss={d_avg:.6f}, T={T:.3f}")
 
-            model.train()
-            gen_seq = torch.stack(generated).view(1, -1, 1)
-            inp = gen_seq[:, :-1]
-            tgt = gen_seq[:, 1:]
+    def evaluate_nll(self, data, max_batches=256):
+        """簡易バリデーション（ガウスNLLの平均）"""
+        self.model.eval()
+        losses, seen = [], 0
+        with torch.no_grad():
+            for seq in self._epoch_iter(data):
+                x = self._to_tensor(seq)                               # [1,L,D]
+                inputs, targets = x[:, :-1, :], x[:, 1:, [0]]          # [1,L-1,D], [1,L-1,1]
+                output, _ = self.model(inputs)
+                mu, logvar = self._parse_mu_logvar(output)
+                loss = gaussian_nll(mu, logvar, targets).item()
+                losses.append(loss)
+                seen += 1
+                if seen >= max_batches: break
+        self.model.train()
+        return float(np.mean(losses)) if losses else float('inf')
 
-            optimizer.zero_grad()
-            # 人工データの平均の予測に対して損失を計算
-            d_output, _ = model(inp)
-            d_mean_pred = d_output[:, :, 0:1]
-            d_loss = criterion(d_mean_pred, tgt)
-            d_loss.backward()
-            optimizer.step()
-            total_dreaming_loss += d_loss.item()
+    # ---------- 内部：1epochの回し方 ----------
+    def _run_epoch_mode(self, data, T):
+        # VANILLA block
+        print(f"[VANILLA] (epoch mode) start")
+        v_sum, v_steps = 0.0, 0
+        for seq in self._epoch_iter(data):
+            loss_v = self._train_step_vanilla(seq)
+            v_sum += loss_v; v_steps += 1
+            if v_steps % 50 == 0:
+                print(f"[VANILLA] step {v_steps}/{self.max_vanilla_steps_per_epoch}, loss={loss_v:.6f}")
+            if v_steps >= self.max_vanilla_steps_per_epoch:
+                break
 
-        print(f"[Epoch {epoch+1}] loss={total_loss/len(data):.6f}, dreaming_loss={total_dreaming_loss/max(1, dreaming_steps):.6f}")
+        # DREAMING block
+        print(f"[DREAMING] (epoch mode) start, T={T:.3f}")
+        d_sum, d_steps = 0.0, 0
+        for _ in range(self.dreaming_steps_per_epoch):
+            start_window = self._make_start_window_from(data)
+            dreamed = self._sample_sequence_continuous_exo(start_window, self.dreaming_seq_len, T)
+            loss_d = self._train_step_dreaming(dreamed)
+            d_sum += loss_d; d_steps += 1
+            if d_steps % 20 == 0:
+                print(f"[DREAMING] step {d_steps}/{self.dreaming_steps_per_epoch}, loss={loss_d:.6f}")
+
+        v_avg = v_sum / max(1, v_steps)
+        d_avg = d_sum / max(1, d_steps)
+        return v_avg, d_avg
+
+    def _run_batch_mode(self, data, T):
+        print(f"[INTERLEAVE] (batch mode) K={self.K_interleave}, T={T:.3f}")
+        v_sum, d_sum, v_steps, d_steps = 0.0, 0.0, 0, 0
+        for i, seq in enumerate(self._epoch_iter(data), 1):
+            loss_v = self._train_step_vanilla(seq)
+            v_sum += loss_v; v_steps += 1
+            if i % self.K_interleave == 0:
+                start_window = self._make_start_window_from_seq(seq)
+                dreamed = self._sample_sequence_continuous_exo(start_window, max(1, self.dreaming_seq_len//2), T)
+                loss_d = self._train_step_dreaming(dreamed)
+                d_sum += loss_d; d_steps += 1
+            if v_steps >= self.max_vanilla_steps_per_epoch: break
+        return v_sum / max(1, v_steps), d_sum / max(1, d_steps)
+
+    def _run_mixed_mode(self, data, T):
+        print(f"[MIXED] lambda_d={self.lambda_d}, T={T:.3f}")
+        v_sum, d_sum, steps = 0.0, 0.0, 0
+        for seq in self._epoch_iter(data):
+            # Vanilla（forwardだけ、後で合成）
+            x = self._to_tensor(seq)
+            inputs, targets = x[:, :-1, :], x[:, 1:, [0]]
+            output, _ = self.model(inputs)
+            mu, logvar = self._parse_mu_logvar(output)
+            loss_v = gaussian_nll(mu, logvar, targets)
+
+            # 短いDreamを同一イテレーションで合成
+            start_window = self._make_start_window_from_seq(seq)
+            dreamed = self._sample_sequence_continuous_exo(start_window, max(1, self.dreaming_seq_len//2), T)
+            inp, tgt = self._dream_to_batch(dreamed)
+            out_d, _ = self.model(inp)
+            mu_d, logvar_d = self._parse_mu_logvar(out_d)
+            loss_d = gaussian_nll(mu_d, logvar_d, tgt)
+
+            loss = loss_v + self.lambda_d * loss_d
+            self.optim.zero_grad(); loss.backward()
+            if self.grad_clip is not None:
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+            self.optim.step()
+
+            v_sum += float(loss_v.item()); d_sum += float(loss_d.item()); steps += 1
+            if steps >= self.max_vanilla_steps_per_epoch: break
+        return v_sum / max(1, steps), d_sum / max(1, steps)
+
+    # ---------- 内部：学習1ステップ ----------
+    def _train_step_vanilla(self, seq):
+        self.model.train()
+        x = self._to_tensor(seq)                               # [1,L,D]
+        if x.size(1) < 2:
+            return 0.0
+        inputs, targets = x[:, :-1, :], x[:, 1:, [0]]          # [1,L-1,D], [1,L-1,1]
+        output, _ = self.model(inputs)                         # output[...,0]=μ,1=logσ²
+        mu, logvar = self._parse_mu_logvar(output)
+        loss = gaussian_nll(mu, logvar, targets)
+        self.optim.zero_grad(); loss.backward()
+        if self.grad_clip is not None:
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        self.optim.step()
+        return float(loss.item())
+
+    def _train_step_dreaming(self, dreamed_list):
+        self.model.train()
+        inp, tgt = self._dream_to_batch(dreamed_list)          # [1,K-1,1], [1,K-1,1]
+        out, _ = self.model(inp)
+        mu, logvar = self._parse_mu_logvar(out)
+        loss = gaussian_nll(mu, logvar, tgt)
+        self.optim.zero_grad(); loss.backward()
+        if self.grad_clip is not None:
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        self.optim.step()
+        return float(loss.item())
+
+    # ---------- 内部：Dreaming 生成 ----------
+    @torch.no_grad()
+    def _sample_sequence_continuous_exo(self, start_window, seq_len, T):
+        """
+        start_window: [1, W, D]（D=1+n_exo）
+        生成：σ_T^2 = T·σ^2（＝あなたの現行実装の「variance * temperature」と等価）
+        exo_mode:
+          - "hold": 外生は直近値を固定
+          - "resample": dataから外生をランダム抽出（簡易）
+          - "roll": 簡易AR(1)で少しだけ動かす
+        """
+        was_training = self.model.training
+        self.model.eval()
+
+        x = start_window.clone().to(self.device)  # [1,W,D]
+        dreamed_target = []
+        hidden = None
+
+        for _ in range(seq_len):
+            output, hidden = self.model(x, hidden)     # output: [1,W,2]
+            mu_t  = output[:, -1:, [0]]
+            lv_t  = output[:, -1:, [1]]
+            lv_t  = lv_t.clamp(self.logvar_clamp[0], self.logvar_clamp[1])
+
+            var   = lv_t.exp().clamp_min(1e-12)
+            var_T = var * max(1e-8, float(T))          # σ_T^2 = T·σ^2
+            sigma_T = var_T.sqrt()
+
+            r_next = mu_t + sigma_T * torch.randn_like(mu_t)  # [1,1,1]
+            dreamed_target.append(r_next.item())
+
+            # 外生を次時点に整える
+            D = x.size(-1)
+            if D > 1:
+                exo_prev = x[:, -1:, 1:]  # [1,1,n_exo]
+                if self.exo_mode == "hold":
+                    exo_next = exo_prev
+                elif self.exo_mode == "resample":
+                    # 簡易：同バッチ開始窓の外生をランダムにノイズ付加（本格実装はデータから厳密抽出）
+                    exo_next = exo_prev + 0.01 * torch.randn_like(exo_prev)
+                else:  # "roll"
+                    exo_next = 0.9 * exo_prev + 0.1 * torch.randn_like(exo_prev)
+                x_next = torch.cat([r_next, exo_next], dim=-1)   # [1,1,D]
+            else:
+                x_next = r_next
+
+            x = torch.cat([x, x_next], dim=1)
+
+        if was_training: self.model.train()
+        return dreamed_target
+
+    # ---------- 内部：前処理/補助 ----------
+    def _to_tensor(self, seq):
+        """
+        入力seq（list/ndarray/tensor） -> torch.Tensor [1,L,D]
+        D=1（外生なし） も D>1（外生あり）もOK
+        """
+        if isinstance(seq, torch.Tensor):
+            arr = seq
+        else:
+            arr = torch.tensor(seq, dtype=torch.float32)
+        if arr.dim() == 1:
+            arr = arr.view(1, -1, 1)
+        elif arr.dim() == 2:
+            arr = arr.unsqueeze(0)
+        else:
+            raise ValueError("seq must be shape [L] or [L,D]")
+        return arr.to(self.device)
+
+    def _parse_mu_logvar(self, output):
+        """
+        あなたの現行モデル仕様に合わせて：
+        output[...,0]=μ, output[...,1]=logσ²
+        """
+        mu  = output[..., [0]]
+        lv  = output[..., [1]].clamp(self.logvar_clamp[0], self.logvar_clamp[1])
+        return mu, lv
+
+    def _make_start_window_from(self, data):
+        """実データからランダムな開始窓を作る（外生があってもOK）"""
+        seq = random.choice(data)
+        arr = self._to_tensor(seq)                # [1,L,D]
+        L = arr.size(1)
+        W = max(5, min(self.dreaming_seq_len, L-1))
+        s = random.randint(0, max(0, L-1-W))
+        return arr[:, s:s+W, :]                   # [1,W,D]
+
+    def _make_start_window_from_seq(self, seq):
+        arr = self._to_tensor(seq)
+        L = arr.size(1)
+        W = max(5, min(self.dreaming_seq_len, L-1))
+        s = random.randint(0, max(0, L-1-W))
+        return arr[:, s:s+W, :]
+
+    def _dream_to_batch(self, dreamed_list):
+        """
+        Dreamingで得たターゲット列 -> 学習用の (inputs, targets)
+        inputs: [1,K-1,1], targets: [1,K-1,1]
+        """
+        y = torch.tensor(dreamed_list, dtype=torch.float32, device=self.device).view(1, -1, 1)
+        return y[:, :-1, :], y[:, 1:, :]
+
+    def _epoch_iter(self, data):
+        """シーケンス単位を1バッチとして回す簡易イテレータ"""
+        idx = list(range(len(data)))
+        random.shuffle(idx)
+        for i in idx:
+            yield data[i]
 
 
 def train_portfolio(model, train_loader, val_loader, n_assets, optimizer, epochs=10, temperature=1.5):

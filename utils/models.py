@@ -83,7 +83,7 @@ class LSTMPriceModel(torch.nn.Module):
     def forward(self, x, hidden=None):
         out, hidden = self.lstm(x, hidden)
         out = self.fc(out)
-        return out, hidden
+        return out#, hidden
 
 
 
