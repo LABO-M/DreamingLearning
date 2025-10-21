@@ -337,6 +337,72 @@ class DreamingTrainer:
         if was_training: self.model.train()
         return dream_seq
 
+    # ---------- 予測 ----------
+    @torch.no_grad()
+    def predict_in_sample(self, seq):
+        """
+        seq: [L, D]（全期間でも、train部分だけでもOK）
+        戻り値: dict { "y": [L-1], "y_hat": [L-1], "err": [L-1] }  ※numpy
+        （時刻 t+1 の真値 y と 1ステップ予測 μ_t を整列）
+        """
+        self.model.eval()
+        x = self._to_tensor(seq)                  # [1,L,D]
+        if x.size(1) < 2:
+            return {"y": np.array([]), "y_hat": np.array([]), "err": np.array([])}
+        inputs, targets = x[:, :-1, :], x[:, 1:, [0]]   # [1,L-1,D], [1,L-1,1]
+        out, _ = self.model(inputs)
+        mu, _ = self._parse_mu_logvar(out)        # [1,L-1,1]
+        y     = targets.squeeze(0).squeeze(-1).cpu().numpy()
+        y_hat = mu.squeeze(0).squeeze(-1).cpu().numpy()
+        return {"y": y, "y_hat": y_hat, "err": (y_hat - y)}
+
+    @torch.no_grad()
+    def predict_out_of_sample(self, seq, test_len, use_mean=True, T=1.0):
+        """
+        seq: [L, D], test_len: 後ろ test_len ステップを予測
+        use_mean=True: μ をそのまま予測値に（推奨）
+                False: N(μ, T·σ^2) から1サンプル（シミュレーション用途）
+        戻り値: dict { "y": [test_len], "y_hat": [test_len] }  ※numpy
+        """
+        self.model.eval()
+        train_arr, test_arr = self.split_train_test(seq, test_len)  # [Ltr,D], [Lte,D]
+        x_tr = self._to_tensor(train_arr)                           # [1,Ltr,D]
+
+        # 1) train 部分で隠れ状態を温める
+        out_tr, hidden = self.model(x_tr)
+
+        # 2) 直近時点のベクトル（target は真値、exo は真値）から開始
+        last_vec = x_tr[:, -1:, :].clone()   # [1,1,D]
+        preds = []
+        for i in range(test_len):
+            # 真の外生（列1..）を test から取得
+            exo_true_next = torch.tensor(test_arr[i:i+1, 1:], dtype=torch.float32, device=self.device).view(1,1,-1)
+
+            # 直前の target（最初は train の真値、その後は前回予測）をベクトル化
+            target_prev = last_vec[:, -1:, [0]]  # [1,1,1]
+
+            # モデルで1歩先の分布を出す（コンテキストは last_vec）
+            out, hidden = self.model(last_vec, hidden)   # out: [1,1,2]
+            mu, logvar = self._parse_mu_logvar(out)
+            if use_mean:
+                target_next = mu
+            else:
+                var_T = logvar.exp().clamp_min(1e-12) * max(1e-8, float(T))
+                target_next = mu + var_T.sqrt() * torch.randn_like(mu)
+
+            # 次の入力ベクトルを作る（target_next と “真の” exo を結合）
+            if last_vec.size(-1) > 1:
+                x_next = torch.cat([target_next, exo_true_next], dim=-1)  # [1,1,D]
+            else:
+                x_next = target_next
+
+            preds.append(target_next.item())
+            last_vec = x_next  # ロール
+
+        y_true = test_arr[:, 0]        # 真のターゲット
+        y_hat  = np.array(preds, dtype=np.float32)
+        return {"y": y_true, "y_hat": y_hat}
+
     # ---------- 内部：前処理/補助 ----------
     def _to_tensor(self, seq):
         """
@@ -354,6 +420,18 @@ class DreamingTrainer:
         else:
             raise ValueError("seq must be shape [L] or [L,D]")
         return arr.to(self.device)
+
+    def split_train_test(self, seq, test_len):
+        """
+        seq: np.ndarray or torch.Tensor [L, D]（列0=ターゲット）
+        test_len: 後ろから test_len ステップをテストに
+        戻り値: train_seq [L_tr, D], test_seq [L_te, D]
+        """
+        arr = seq.detach().cpu().numpy() if isinstance(seq, torch.Tensor) else np.asarray(seq)
+        assert arr.ndim == 2, "seq must be [L, D]"
+        L = arr.shape[0]
+        assert 1 <= test_len < L, "test_len を見直してください"
+        return arr[:L - test_len], arr[L - test_len:]
 
     def _parse_mu_logvar(self, output):
         """
