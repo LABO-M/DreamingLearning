@@ -127,10 +127,10 @@ class DreamingTrainer:
             self.model.train()
             steps = 0
             for seq in self._epoch_iter(data):
-                loss_v = self._train_step_vanilla(seq)
+                loss_v,mse_v, mae_v = self._train_step_vanilla(seq)
                 steps += 1
                 if steps % 50 == 0:
-                    print(f"[WARMUP] step {steps}, loss={loss_v:.6f}")
+                    print(f"[WARMUP] step {steps}, loss={loss_v:.6f}, mse={mse_v:.6f}, mae={mae_v:.6f}")
                 if steps >= self.warm_vanilla_steps:
                     break
 
@@ -183,42 +183,71 @@ class DreamingTrainer:
         # VANILLA block
         print(f"[VANILLA] (epoch mode) start")
         v_sum, v_steps = 0.0, 0
+        v_mse_sum, v_mae_sum = 0.0, 0.0
         for seq in self._epoch_iter(data):
-            loss_v = self._train_step_vanilla(seq)
+            loss_v, mse_v, mae_v = self._train_step_vanilla(seq)
             v_sum += loss_v; v_steps += 1
+            v_mse_sum += mse_v
+            v_mae_sum += mae_v
             if v_steps % 50 == 0:
-                print(f"[VANILLA] step {v_steps}/{self.max_vanilla_steps_per_epoch}, loss={loss_v:.6f}")
+                print(f"[VANILLA] step {v_steps}/{self.max_vanilla_steps_per_epoch}, loss={loss_v:.6f}, mse={mse_v:.6f}, mae={mae_v:.6f}")
             if v_steps >= self.max_vanilla_steps_per_epoch:
                 break
 
         # DREAMING block
         print(f"[DREAMING] (epoch mode) start, T={T:.3f}")
         d_sum, d_steps = 0.0, 0
+        d_mse_sum, d_mae_sum = 0.0, 0.0
         for _ in range(self.dreaming_steps_per_epoch):
             start_window = self._make_start_window_from(data)
             dream_seq = self._sample_sequence_continuous_exo(start_window, self.dreaming_seq_len, T)
-            loss_d = self._train_step_dreaming(dream_seq)
+            loss_d, mse_d, mae_d = self._train_step_dreaming(dream_seq)
             d_sum += loss_d; d_steps += 1
+            d_mse_sum += mse_d
+            d_mae_sum += mae_d
             if d_steps % 20 == 0:
-                print(f"[DREAMING] step {d_steps}/{self.dreaming_steps_per_epoch}, loss={loss_d:.6f}")
+                print(f"[DREAMING] step {d_steps}/{self.dreaming_steps_per_epoch}, loss={loss_d:.6f}, mse={mse_d:.6f}, mae={mae_d:.6f}")
 
         v_avg = v_sum / max(1, v_steps)
+        v_mse = v_mse_sum / max(1, v_steps)
+        v_mae = v_mae_sum / max(1, v_steps)
         d_avg = d_sum / max(1, d_steps)
+        d_mse = d_mse_sum / max(1, d_steps)
+        d_mae = d_mae_sum / max(1, d_steps)
+
+        print(f"[EPOCH MODE] VANILLA avg_loss={v_avg:.6f}, DREAMING avg_loss={d_avg:.6f}, mse={v_mse:.6f}, mae={v_mae:.6f}")
+        print(f"[EPOCH MODE] DREAMING avg_loss={d_avg:.6f}, mse={d_mse:.6f}, mae={d_mae:.6f}")
+
         return v_avg, d_avg
 
     def _run_batch_mode(self, data, T):
         print(f"[INTERLEAVE] (batch mode) K={self.K_interleave}, T={T:.3f}")
         v_sum, d_sum, v_steps, d_steps = 0.0, 0.0, 0, 0
+        v_mse_sum, v_mae_sum = 0.0, 0.0
+        d_mse_sum, d_mae_sum = 0.0, 0.0
         for i, seq in enumerate(self._epoch_iter(data), 1):
-            loss_v = self._train_step_vanilla(seq)
+            loss_v, mse_v, mae_v = self._train_step_vanilla(seq)
             v_sum += loss_v; v_steps += 1
+            v_mse_sum += mse_v; v_mae_sum += mae_v
             if i % self.K_interleave == 0:
                 start_window = self._make_start_window_from_seq(seq)
                 dreamed = self._sample_sequence_continuous_exo(start_window, max(1, self.dreaming_seq_len//2), T)
-                loss_d = self._train_step_dreaming(dreamed)
+                loss_d, mse_d, mae_d = self._train_step_dreaming(dreamed)
                 d_sum += loss_d; d_steps += 1
+                d_mse_sum += mse_d; d_mae_sum += mae_d
             if v_steps >= self.max_vanilla_steps_per_epoch: break
-        return v_sum / max(1, v_steps), d_sum / max(1, d_steps)
+
+        v_avg = v_sum / max(1, v_steps)
+        d_avg = d_sum / max(1, d_steps)
+        v_mse = v_mse_sum / max(1, v_steps)
+        v_mae = v_mae_sum / max(1, v_steps)
+        d_mse = d_mse_sum / max(1, d_steps)
+        d_mae = d_mae_sum / max(1, d_steps)
+
+        print(f"[BATCH MODE] VANILLA avg_loss={v_avg:.6f}, mse={v_mse:.6f}, mae={v_mae:.6f}")
+        print(f"[BATCH MODE] DREAMING avg_loss={d_avg:.6f}, mse={d_mse:.6f}, mae={d_mae:.6f}")
+
+        return v_avg, d_avg
 
     def _run_mixed_mode(self, data, T):
         print(f"[MIXED] lambda_d={self.lambda_d}, T={T:.3f}")
@@ -254,16 +283,17 @@ class DreamingTrainer:
         self.model.train()
         x = self._to_tensor(seq)                               # [1,L,D]
         if x.size(1) < 2:
-            return 0.0
+            return 0.0, 0.0, 0.0
         inputs, targets = x[:, :-1, :], x[:, 1:, [0]]          # [1,L-1,D], [1,L-1,1]
         output, _ = self.model(inputs)                         # output[...,0]=μ,1=logσ²
         mu, logvar = self._parse_mu_logvar(output)
-        loss = gaussian_nll(mu, logvar, targets)
+        loss = gaussian_nll(mu, logvar, targets)               # ガウス負対数尤度
         self.optim.zero_grad(); loss.backward()
         if self.grad_clip is not None:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optim.step()
-        return float(loss.item())
+        mse, mae = self._mse_mae(mu, targets)
+        return float(loss.item()), mse, mae
 
     def _train_step_dreaming(self, dream_seq):
         """
@@ -282,7 +312,8 @@ class DreamingTrainer:
         if self.grad_clip is not None:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optim.step()
-        return float(loss.item())
+        mse, mae = self._mse_mae(mu, tgt)
+        return float(loss.item()), mse, mae
 
 
     # ---------- 内部：Dreaming 生成 ----------
@@ -472,6 +503,42 @@ class DreamingTrainer:
         random.shuffle(idx)
         for i in idx:
             yield data[i]
+
+    def _mse_mae(self, mu: torch.Tensor, target: torch.Tensor):
+        """
+        mu, target: [B, L, 1]
+        戻り: mse(float), mae(float)
+        """
+        with torch.no_grad():
+            diff = (mu - target)
+            mse = float((diff ** 2).mean().item())
+            mae = float(diff.abs().mean().item())
+        return mse, mae
+    @torch.no_grad()
+    def evaluate_metrics(self, data, max_batches=512):
+        """
+        data: list[[L,D]] の系列群（train用にもtest用にもOK）
+        戻り: {"nll":..., "mse":..., "mae":...} の平均
+        """
+        self.model.eval()
+        nlls, mses, maes = [], [], []
+        seen = 0
+        for seq in self._epoch_iter(data):
+            x = self._to_tensor(seq)
+            if x.size(1) < 2: continue
+            inputs, targets = x[:, :-1, :], x[:, 1:, [0]]
+            out, _ = self.model(inputs)
+            mu, logvar = self._parse_mu_logvar(out)
+            nlls.append(gaussian_nll(mu, logvar, targets).item())
+            mse, mae = self._mse_mae(mu, targets)
+            mses.append(mse); maes.append(mae)
+            seen += 1
+            if seen >= max_batches: break
+        return {
+            "nll": float(np.mean(nlls)) if nlls else float("nan"),
+            "mse": float(np.mean(mses)) if mses else float("nan"),
+            "mae": float(np.mean(maes)) if maes else float("nan"),
+        }
 
 
 def train_portfolio(model, train_loader, val_loader, n_assets, optimizer, epochs=10, temperature=1.5):
