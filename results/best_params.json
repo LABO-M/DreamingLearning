@@ -1,0 +1,10 @@
+{
+    "hidden": 64,
+    "layers": 1,
+    "proj_dim": 128,
+    "dropout": 0.2,
+    "lr": 0.001,
+    "T": 1.8,
+    "mode": "batch",
+    "K": 8
+}
