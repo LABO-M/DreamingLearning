@@ -28,6 +28,22 @@ def gaussian_nll(mu, logvar, target):
     nll = 0.5 * ((target - mu) ** 2 / var + logvar)
     return nll.mean()
 
+def student_t_nll(mu, log_s, log_nu, y):
+    """
+    mu, log_s, log_nu, y: shape [B, L, 1]
+    返り値: バッチ平均の NLL（定数項込み）
+    """
+    s  = log_s.clamp(-8.0, 4.0).exp()             # σ in [~0.0003, ~54]
+    nu = log_nu.clamp(math.log(2.05), math.log(60.0)).exp()  # ν>2
+    z  = (y - mu) / (s + 1e-12)                   # 標準化
+    z2 = z*z
+
+    # NLL = -log f_tν(y|μ,σ)
+    # 参考式: 0.5*log(pi*nu) + log(s) + lgamma((nu+1)/2) - lgamma(nu/2) + 0.5*(nu+1)*log(1+z^2/nu)
+    const = 0.5*(math.log(math.pi)) + torch.log(nu)/2 + torch.log(s)
+    nll = const + torch.lgamma((nu+1)/2) - torch.lgamma(nu/2) + 0.5*(nu+1)*torch.log1p(z2/nu)
+    return nll.mean()
+
 class TemperatureScheduler:
     def __init__(self, kind="constant", base=1.5, **kw):
         self.kind, self.base, self.kw = kind, float(base), kw
@@ -72,7 +88,7 @@ class DreamingTrainer:
     - data: list of sequences（各要素 shape=[L] か [L,D], D=1+n_exo）
     """
 
-    def __init__(self, model, optimizer, device='cpu',
+    def __init__(self, model, optimizer, device='cpu', loss_mode: str ="gaussian",
                  # 粒度
                  interleave_mode="epoch",  # "epoch"|"batch"|"mixed"
                  epochs=5, warm_vanilla_steps=0,
@@ -92,6 +108,7 @@ class DreamingTrainer:
         self.model = model
         self.optim = optimizer
         self.device = device
+        self.loss_mode = loss_mode
 
         self.interleave_mode = interleave_mode
         self.epochs = epochs
@@ -265,8 +282,7 @@ class DreamingTrainer:
             dreamed = self._sample_sequence_continuous_exo(start_window, max(1, self.dreaming_seq_len//2), T)
             inp, tgt = self._dream_to_batch(dreamed)
             out_d, _ = self.model(inp)
-            mu_d, logvar_d = self._parse_mu_logvar(out_d)
-            loss_d = gaussian_nll(mu_d, logvar_d, tgt)
+            loss_d, _, _, _ = self._compute_loss_and_metrics(out_d, tgt)
 
             loss = loss_v + self.lambda_d * loss_d
             self.optim.zero_grad(); loss.backward()
@@ -286,13 +302,11 @@ class DreamingTrainer:
             return 0.0, 0.0, 0.0
         inputs, targets = x[:, :-1, :], x[:, 1:, [0]]          # [1,L-1,D], [1,L-1,1]
         output, _ = self.model(inputs)                         # output[...,0]=μ,1=logσ²
-        mu, logvar = self._parse_mu_logvar(output)
-        loss = gaussian_nll(mu, logvar, targets)               # ガウス負対数尤度
+        loss, mse, mae, _ = self._compute_loss_and_metrics(output, targets)
         self.optim.zero_grad(); loss.backward()
         if self.grad_clip is not None:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optim.step()
-        mse, mae = self._mse_mae(mu, targets)
         return float(loss.item()), mse, mae
 
     def _train_step_dreaming(self, dream_seq):
@@ -305,14 +319,12 @@ class DreamingTrainer:
         tgt = dream_seq[:, 1:, [0]]        # [1,K-1,1]  ← 教師はターゲット列のみ
 
         out, _ = self.model(inp)
-        mu, logvar = self._parse_mu_logvar(out)
-        loss = gaussian_nll(mu, logvar, tgt)
+        loss, mse, mae, _ = self._compute_loss_and_metrics(out, tgt)
 
         self.optim.zero_grad(); loss.backward()
         if self.grad_clip is not None:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optim.step()
-        mse, mae = self._mse_mae(mu, tgt)
         return float(loss.item()), mse, mae
 
 
@@ -528,9 +540,8 @@ class DreamingTrainer:
             if x.size(1) < 2: continue
             inputs, targets = x[:, :-1, :], x[:, 1:, [0]]
             out, _ = self.model(inputs)
-            mu, logvar = self._parse_mu_logvar(out)
-            nlls.append(gaussian_nll(mu, logvar, targets).item())
-            mse, mae = self._mse_mae(mu, targets)
+            nll, mse, mae, _ = self._compute_loss_and_metrics(out, targets)
+            nlls.append(nll.item())
             mses.append(mse); maes.append(mae)
             seen += 1
             if seen >= max_batches: break
@@ -539,6 +550,28 @@ class DreamingTrainer:
             "mse": float(np.mean(mses)) if mses else float("nan"),
             "mae": float(np.mean(maes)) if maes else float("nan"),
         }
+    def _compute_loss_and_metrics(self, out, targets):
+        """
+        out: [B,L,2 or 3], targets: [B,L,1]
+        戻り: (loss, mse, mae, extra_dict)
+        """
+        if self.loss_mode == "gaussian":
+            mu = out[..., [0]]
+            lv = out[..., [1]]
+            loss = gaussian_nll(mu, lv, targets)
+        elif self.loss_mode == "studentT":
+            mu     = out[..., [0]]
+            log_s  = out[..., [1]]
+            log_nu = out[..., [2]]
+            loss = student_t_nll(mu, log_s, log_nu, targets)
+        else:
+            raise ValueError(f"unknown loss_mode: {self.loss_mode}")
+
+        # 点誤差（参考用）
+        mse = torch.mean((out[..., [0]] - targets)**2).item()
+        mae = torch.mean(torch.abs(out[..., [0]] - targets)).item()
+        return loss, mse, mae, {}
+
 
 
 def train_portfolio(model, train_loader, val_loader, n_assets, optimizer, epochs=10, temperature=1.5):

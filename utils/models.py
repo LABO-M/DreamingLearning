@@ -2,6 +2,9 @@
 
 import torch
 import torch.nn as nn
+from typing import Optional, Tuple
+import math
+
 
 # ----------------------------------
 # LSTM モデル
@@ -122,8 +125,50 @@ class LSTMGaussian(nn.Module):
         out = torch.cat([mu, logvar], dim=-1)         # [B,L,2]
         return out, hidden_next
 
+class LSTMStudentT(nn.Module):
+    """
+    出力: [B, L, 3] = (mu, log_scale, log_nu)
+      - mu        : 予測平均
+      - log_scale : log σ（スケール, σ>0）
+      - log_nu    : log ν（自由度, ν>2）
+    既存の LSTMGaussian と同じ使い勝手で forward(x)->(out, hidden)
+    """
+    def __init__(self,
+                 input_dim: int,
+                 hidden_size: int = 128,
+                 num_layers: int = 1,
+                 proj_dim: Optional[int] = None,
+                 dropout: float = 0.1,
+                 use_layernorm: bool = True):
+        super().__init__()
+        self.use_proj = proj_dim is not None and proj_dim != input_dim
+        d_in = proj_dim or input_dim
 
+        if self.use_proj:
+            self.in_proj = nn.Linear(input_dim, proj_dim)
+            self.ln_in = nn.LayerNorm(proj_dim) if use_layernorm else nn.Identity()
+        else:
+            self.in_proj = nn.Identity()
+            self.ln_in = nn.LayerNorm(input_dim) if use_layernorm else nn.Identity()
 
+        self.rnn = nn.LSTM(d_in, hidden_size, num_layers,
+                           batch_first=True,
+                           dropout=dropout if num_layers > 1 else 0.0)
+        self.ln_h = nn.LayerNorm(hidden_size) if use_layernorm else nn.Identity()
+
+        H = hidden_size
+        self.head = nn.Sequential(
+            nn.Linear(H, H), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(H, 3)  # (mu, log_s, log_nu)
+        )
+
+    def forward(self, x: torch.Tensor, hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+        # x: [B, L, D]
+        x = self.ln_in(self.in_proj(x))
+        h, hidden = self.rnn(x, hidden)
+        h = self.ln_h(h)
+        out = self.head(h)  # [B, L, 3]
+        return out, hidden
 
 class PortfolioLSTMModel(nn.Module):
     def __init__(self, n_assets, hidden_dim=128, num_layers=2):
