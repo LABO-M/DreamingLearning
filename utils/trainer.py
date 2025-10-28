@@ -11,6 +11,7 @@ import random
 import numpy as np
 import os
 import math
+from scipy.special import betainc
 
 # ===================== ユーティリティ =====================
 
@@ -43,6 +44,53 @@ def student_t_nll(mu, log_s, log_nu, y):
     const = 0.5*(math.log(math.pi)) + torch.log(nu)/2 + torch.log(s)
     nll = const + torch.lgamma((nu+1)/2) - torch.lgamma(nu/2) + 0.5*(nu+1)*torch.log1p(z2/nu)
     return nll.mean()
+
+@torch.no_grad()
+def student_t_cdf_standard(x: torch.Tensor, nu: torch.Tensor) -> torch.Tensor:
+    """
+    標準 t(v) の CDF。x, nu はブロードキャスト可能であること。
+    公式:
+      t >= 0:  F(t) = 1 - 0.5 * I_{ v/(v + t^2) }(v/2, 1/2)
+      t <  0:  F(t) = 0.5 * I_{ v/(v + t^2) }(v/2, 1/2)
+    ※ torch.special.betainc は正則化不完全ベータ I_x(a,b)
+    """
+    x_np = x.detach().cpu().numpy()
+    nu_np = nu.detach().cpu().numpy()
+
+    # t >= 0 と t < 0 で場合分け
+    t = nu_np / (nu_np + x_np**2)
+    a = 0.5 * nu_np
+    b = 0.5
+    inc = betainc(a, b, t).clip(0.0, 1.0)
+
+    cdf_np = np.where(x_np >= 0, 1.0 - 0.5 * inc, 0.5 * inc)
+    return torch.from_numpy(cdf_np).to(x.device, dtype=x.dtype)
+
+@torch.no_grad()
+def student_t_ppf_standard(p: torch.Tensor, nu: torch.Tensor, iters: int = 50) -> torch.Tensor:
+    """
+    標準 t(v) の PPF。cdf(x; v)=p を二分法で解く。
+    p, nu はブロードキャスト可能な同shape想定。
+    """
+    device = p.device
+    p = p.to(device).clamp(1e-6, 1 - 1e-6)
+    nu = nu.to(device).clamp_min(2.001)
+
+    # 初期区間（正規近似で中心を置きつつ十分広くとる）
+    normal = torch.distributions.Normal(torch.tensor(0.0, device=device),
+                                        torch.tensor(1.0, device=device))
+    z0 = normal.icdf(p)
+    lo = (z0 - 50.0).clone()
+    hi = (z0 + 50.0).clone()
+
+    for _ in range(iters):
+        mid = (lo + hi) * 0.5
+        c = student_t_cdf_standard(mid, nu)
+        go_left = (c >= p)
+        hi = torch.where(go_left, mid, hi)
+        lo = torch.where(go_left, lo, mid)
+
+    return (lo + hi) * 0.5
 
 class TemperatureScheduler:
     def __init__(self, kind="constant", base=1.5, **kw):
@@ -88,7 +136,7 @@ class DreamingTrainer:
     - data: list of sequences（各要素 shape=[L] か [L,D], D=1+n_exo）
     """
 
-    def __init__(self, model, optimizer, device='cpu', loss_mode: str ="gaussian",
+    def __init__(self, model, optimizer, device='cpu', loss_mode: str ="gaussian", # "gaussian"|"studentT"
                  # 粒度
                  interleave_mode="epoch",  # "epoch"|"batch"|"mixed"
                  epochs=5, warm_vanilla_steps=0,
@@ -96,6 +144,13 @@ class DreamingTrainer:
                  dreaming_steps_per_epoch=50,
                  dreaming_seq_len=50,
                  K_interleave=6, lambda_d=0.2,
+                 # 自由度
+                 lambda_nu_l2: float = 0.0,
+                 lambda_nu_inv: float = 0.0,
+                 lambda_scale_l2: float = 0.0,
+                 nu_target: float = 10.0,
+                 nu_floor: float = 3.0,
+                 nu_clamp: tuple = (2.05, 60.0),
                  # 温度
                  temperature=1.5,
                  temperature_schedule="constant",
@@ -118,6 +173,13 @@ class DreamingTrainer:
         self.dreaming_seq_len = dreaming_seq_len
         self.K_interleave = K_interleave
         self.lambda_d = lambda_d
+
+        self.lambda_nu_l2 = lambda_nu_l2
+        self.lambda_nu_inv = lambda_nu_inv
+        self.lambda_scale_l2 = lambda_scale_l2
+        self.nu_target = float(nu_target)
+        self.nu_floor = float(nu_floor)
+        self.nu_clamp = (float(nu_clamp[0]), float(nu_clamp[1]))
 
         self.temperature = temperature
         self.sched = TemperatureScheduler(temperature_schedule, base=temperature,
@@ -187,8 +249,7 @@ class DreamingTrainer:
                 x = self._to_tensor(seq)                               # [1,L,D]
                 inputs, targets = x[:, :-1, :], x[:, 1:, [0]]          # [1,L-1,D], [1,L-1,1]
                 output, _ = self.model(inputs)
-                mu, logvar = self._parse_mu_logvar(output)
-                loss = gaussian_nll(mu, logvar, targets).item()
+                loss, _, _ = self._compute_loss_and_metrics(output, targets).item()
                 losses.append(loss)
                 seen += 1
                 if seen >= max_batches: break
@@ -426,12 +487,29 @@ class DreamingTrainer:
 
             # モデルで1歩先の分布を出す（コンテキストは last_vec）
             out, hidden = self.model(last_vec, hidden)   # out: [1,1,2]
-            mu, logvar = self._parse_mu_logvar(out)
-            if use_mean:
-                target_next = mu
+            if self.loss_mode == "gaussian":
+                mu, logvar = self._parse_mu_logvar(out)
+                if use_mean:
+                    target_next = mu
+                else:
+                    var_T = logvar.exp().clamp_min(1e-12) * max(1e-8, float(T))
+                    target_next = mu + var_T.sqrt() * torch.randn_like(mu)
+            elif self.loss_mode == "studentT":
+                mu = out[..., [0]]
+                log_s = out[..., [1]]
+                log_nu = out[..., [2]]
+                s = log_s.exp().clamp_min(1e-12)
+                nu = log_nu.exp().clamp_min(2.01)
+                if use_mean:
+                    target_next = mu
+                else:
+                    dist = torch.distributions.StudentT(
+                        df = nu.squeeze(-1),loc = mu.squeeze(-1), scale = s.squeeze(-1)
+                    )
+                    sample = dist.sample()
+                    target_next = sample.view_as(mu)
             else:
-                var_T = logvar.exp().clamp_min(1e-12) * max(1e-8, float(T))
-                target_next = mu + var_T.sqrt() * torch.randn_like(mu)
+                raise ValueError(f"Unknown loss_mode: {self.loss_mode}")
 
             # 次の入力ベクトルを作る（target_next と “真の” exo を結合）
             if last_vec.size(-1) > 1:
@@ -531,10 +609,22 @@ class DreamingTrainer:
         """
         data: list[[L,D]] の系列群（train用にもtest用にもOK）
         戻り: {"nll":..., "mse":..., "mae":...} の平均
+
+        NLL: ガウスNLL平均
+        MSE: 点誤差平均
+        MAE: 点誤差平均
+        Coverage: 90%信頼区間カバレッジ平均
         """
         self.model.eval()
         nlls, mses, maes = [], [], []
+        covs_90 = []
         seen = 0
+
+            # 分位点用の常数（正規）
+        standard_normal = torch.distributions.Normal(0.0, 1.0)
+        q = 0.90
+        alpha = 1.0 - q
+
         for seq in self._epoch_iter(data):
             x = self._to_tensor(seq)
             if x.size(1) < 2: continue
@@ -543,12 +633,42 @@ class DreamingTrainer:
             nll, mse, mae, _ = self._compute_loss_and_metrics(out, targets)
             nlls.append(nll.item())
             mses.append(mse); maes.append(mae)
+
+            if self.loss_mode == "gaussian":
+                mu  = out[..., 0]                                 # [B,L]
+                var = out[..., 1].exp().clamp_min(1e-12)          # logvar -> var
+                sigma = var.sqrt()
+                z_lo = standard_normal.icdf(torch.tensor(alpha/2, device=out.device))
+                z_hi = standard_normal.icdf(torch.tensor(1.0 - alpha/2, device=out.device))
+                L = mu + sigma * z_lo
+                U = mu + sigma * z_hi
+
+            elif self.loss_mode == "studentT":
+                mu     = out[..., 0]
+                s      = out[..., 1].exp().clamp_min(1e-12)
+                nu     = out[..., 2].exp().clamp_min(2.01)
+                # 形状を mu と合わせたテンソルで icdf を評価
+                p_lo = torch.full_like(mu, alpha/2)
+                p_hi = torch.full_like(mu, 1.0 - alpha/2)
+                t_lo = student_t_ppf_standard(p_lo, nu)
+                t_hi = student_t_ppf_standard(p_hi, nu)
+                L = mu + s * t_lo
+                U = mu + s * t_hi
+
+            else:
+                raise ValueError(f"unknown loss_mode: {self.loss_mode}")
+            tgt = targets.squeeze(-1)  # [B,L]
+            in_interval = ((tgt >= L) & (tgt <= U)).float().mean().item()
+            covs_90.append(in_interval)
+
             seen += 1
             if seen >= max_batches: break
         return {
             "nll": float(np.mean(nlls)) if nlls else float("nan"),
             "mse": float(np.mean(mses)) if mses else float("nan"),
             "mae": float(np.mean(maes)) if maes else float("nan"),
+            "coverage_90": float(np.mean(covs_90)) if covs_90 else float("nan"),
+            "cov_loss_90": (float(np.mean(covs_90)) - 0.90) ** 2 if covs_90 else float("nan"),
         }
     def _compute_loss_and_metrics(self, out, targets):
         """
@@ -563,7 +683,21 @@ class DreamingTrainer:
             mu     = out[..., [0]]
             log_s  = out[..., [1]]
             log_nu = out[..., [2]]
-            loss = student_t_nll(mu, log_s, log_nu, targets)
+            base_loss = student_t_nll(mu, log_s, log_nu, targets)
+
+            # 正則化項
+            reg = 0.0
+            if self.lambda_nu_l2 > 0.0:
+                reg = reg + self.lambda_nu_l2 * torch.mean((log_nu - math.log(self.nu_target))**2)
+            if self.lambda_nu_inv > 0.0:
+                nu = log_nu.exp()
+                reg = reg + self.lambda_nu_inv * torch.mean(
+                    (self.nu_floor / nu)**2
+                )
+            if self.lambda_scale_l2 > 0.0:
+                reg = reg + self.lambda_scale_l2 * torch.mean(log_s**2)
+
+            loss = base_loss + reg
         else:
             raise ValueError(f"unknown loss_mode: {self.loss_mode}")
 
