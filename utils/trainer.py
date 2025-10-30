@@ -707,7 +707,6 @@ class DreamingTrainer:
         return loss, mse, mae, {}
 
 
-
 def train_portfolio(model, train_loader, val_loader, n_assets, optimizer, epochs=10, temperature=1.5):
     vol_criterion = nn.MSELoss()
     corr_criterion = nn.MSELoss()

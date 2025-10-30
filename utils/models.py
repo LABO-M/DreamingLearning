@@ -2,8 +2,96 @@
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
-import math
+from typing import Optional, Literal, Tuple
+
+class LSTMWindowModel(nn.Module):
+    """
+    LSTM-based forecaster for windowed time series.
+    Maps (B, input_width, num_features) ->
+      - classification: (B, label_width, num_labels, num_classes)  [logits]
+      - regression:     (B, label_width, num_labels)               [predictions]
+    """
+    def __init__(
+        self,
+        input_size: int,
+        label_width: int,
+        num_labels: int,
+        task_type: Literal["classification", "regression"],
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        bidirectional: bool = False,
+        # classification only
+        num_classes: Optional[int] = None,
+        # optional MLP head depth
+        mlp_hidden: Optional[int] = None,
+    ):
+        super().__init__()
+        assert task_type in ("classification", "regression")
+        self.task_type = task_type
+        self.label_width = int(label_width)
+        self.num_labels = int(num_labels)
+        self.num_classes = int(num_classes) if num_classes is not None else None
+
+        self.hidden_size = int(hidden_size)
+        self.num_layers = int(num_layers)
+        self.bidirectional = bool(bidirectional)
+
+        self.encoder = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+        enc_out_dim = hidden_size * (2 if bidirectional else 1)
+
+        # Head: project encoder summary to the entire prediction horizon at once
+        if task_type == "classification":
+            if self.num_classes is None:
+                raise ValueError("num_classes is required for classification.")
+            out_dim = self.label_width * self.num_labels * self.num_classes
+        else:
+            out_dim = self.label_width * self.num_labels
+
+        layers = []
+        if mlp_hidden is not None and mlp_hidden > 0:
+            layers += [nn.Linear(enc_out_dim, mlp_hidden), nn.ReLU(inplace=True)]
+            layers += [nn.Linear(mlp_hidden, out_dim)]
+        else:
+            layers += [nn.Linear(enc_out_dim, out_dim)]
+        self.head = nn.Sequential(*layers)
+
+        # Optional layer norm on encoder summary for stability
+        self.norm = nn.LayerNorm(enc_out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, input_width, num_features)
+        returns:
+          classification: (B, label_width, num_labels, num_classes) logits
+          regression:     (B, label_width, num_labels) predictions
+        """
+        # Encode the input window
+        _, (h_n, _) = self.encoder(x)  # h_n: (num_layers * num_directions, B, hidden)
+        # Take last layer's hidden states (and concat directions if biLSTM)
+        if self.bidirectional:
+            h_last_f = h_n[-2]  # (B, H)
+            h_last_b = h_n[-1]  # (B, H)
+            h = torch.cat([h_last_f, h_last_b], dim=1)
+        else:
+            h = h_n[-1]         # (B, H)
+
+        h = self.norm(h)
+        y = self.head(h)        # (B, out_dim)
+
+        B = x.size(0)
+        if self.task_type == "classification":
+            y = y.view(B, self.label_width, self.num_labels, self.num_classes)
+        else:
+            y = y.view(B, self.label_width, self.num_labels)
+        return y
 
 
 # ----------------------------------
